@@ -1,0 +1,20 @@
+# Keil MDK build artifacts
+MDK/output/
+MDK/RTE/
+MDK/build.txt
+*.uvoptx
+*.uvguix.*
+*.uvguix
+*.bak
+*.dep
+*.o
+*.d
+*.axf
+*.hex
+*.lnp
+*.htm
+*.map
+*.lst
+
+# User files
+build.txt
