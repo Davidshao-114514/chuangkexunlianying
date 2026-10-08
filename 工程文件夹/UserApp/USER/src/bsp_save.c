@@ -20,12 +20,21 @@
 typedef struct
 {
     uint32_t magic;         /* = SAVE_MAGIC 表示记录有效 */
-    uint16_t brightness;    /* 亮度千分数 100..1000 */
-    uint16_t reserved;      /* 填充 */
+    uint16_t brightness1;   /* 组1 亮度千分数 (0=熄灭, >=30) */
+    uint16_t brightness2;   /* 组2 亮度千分数 (0=熄灭, >=30) */
     uint32_t rtc_sec;       /* 关机时刻: RTC 当天秒数 (00:00:00 起) */
 } SaveRecord_t;
 
-static uint16_t s_boot_brightness = BSP_SAVE_DEFAULT_BRIGHT;    /* 开机亮度 */
+static uint16_t s_boot_brightness  = BSP_SAVE_DEFAULT_BRIGHT;   /* 开机亮度 组1 */
+static uint16_t s_boot_brightness2 = BSP_SAVE_DEFAULT_BRIGHT;   /* 开机亮度 组2 */
+
+/**
+ * @brief 恢复值处理: 目前直接使用 (3% 下限已开放; 如需钳位可在此加)
+ */
+static uint16_t Save_ClampBright(uint16_t v)
+{
+    return (v <= 1000U) ? v : BSP_SAVE_DEFAULT_BRIGHT;
+}
 
 /**
  * @brief 读取 RTC 当前时间并换算为"当天秒数"
@@ -74,7 +83,7 @@ void BSP_SAVE_Init(void)
 
     /* ---- 3. 读取 Flash 记录, 判断是否在恢复窗口内 ---- */
     if ((rec->magic == SAVE_MAGIC) &&
-        (rec->brightness >= 100U) && (rec->brightness <= 1000U))
+        (rec->brightness1 <= 1000U) && (rec->brightness2 <= 1000U))
     {
         now   = RTC_GetDaySec();
         saved = rec->rtc_sec;
@@ -82,16 +91,27 @@ void BSP_SAVE_Init(void)
         /* 同一时间轴且间隔 <= 1 小时 -> 恢复; 掉电重启(RTC 归零)时
          * now < saved, 自动落入"不恢复"分支 */
         if ((now >= saved) && ((now - saved) <= BSP_SAVE_WINDOW_SEC))
-            s_boot_brightness = rec->brightness;
+        {
+            s_boot_brightness  = Save_ClampBright(rec->brightness1);
+            s_boot_brightness2 = Save_ClampBright(rec->brightness2);
+        }
     }
 }
 
 /**
- * @brief 获取开机亮度 (窗口内为保存值, 否则默认 10%)
+ * @brief 获取开机亮度 组1 (窗口内为保存值, 否则默认 10%)
  */
 uint16_t BSP_SAVE_GetBootBrightness(void)
 {
     return s_boot_brightness;
+}
+
+/**
+ * @brief 获取开机亮度 组2
+ */
+uint16_t BSP_SAVE_GetBootBrightness2(void)
+{
+    return s_boot_brightness2;
 }
 
 /**
@@ -103,18 +123,19 @@ uint32_t BSP_SAVE_GetRtcSec(void)
 }
 
 /**
- * @brief 保存亮度到 Flash (最后一页)
- * @param brightness 当前亮度千分数 (100..1000)
+ * @brief 保存两组亮度到 Flash (最后一页)
+ * @param bright1 组1 亮度千分数 (0 或 30..1000)
+ * @param bright2 组2 亮度千分数 (0 或 30..1000)
  * @note 调用后即进入关机流程; 擦写期间关中断防止取指/时序异常
  */
-void BSP_SAVE_StoreOnShutdown(uint16_t brightness)
+void BSP_SAVE_StoreOnShutdown(uint16_t bright1, uint16_t bright2)
 {
     SaveRecord_t rec;
 
-    rec.magic      = SAVE_MAGIC;
-    rec.brightness = brightness;
-    rec.reserved   = 0xFFFFU;
-    rec.rtc_sec    = RTC_GetDaySec();
+    rec.magic       = SAVE_MAGIC;
+    rec.brightness1 = bright1;
+    rec.brightness2 = bright2;
+    rec.rtc_sec     = RTC_GetDaySec();
 
     __disable_irq();
     FLASH_UnlockPages(SAVE_ADDR, SAVE_ADDR);                /* 解锁最后一页 */

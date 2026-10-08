@@ -62,16 +62,29 @@ typedef struct
 } LEDGroup_t;
 
 /* ============================ 电池保护阈值 ============================ */
-#define BAT_LOW_MV         3500U   /* 电压 < 3500mV: 电量低提醒 */
-#define BAT_WARN_RECOVER_MV 3550U  /* 回升到 3550mV: 解除低电提醒 (滞回) */
+#define BAT_LOW_MV         3350U   /* 电压 < 3350mV: 电量低提醒 (提高电池容量使用度) */
+#define BAT_WARN_RECOVER_MV 3400U  /* 回升到 3400mV: 解除低电提醒 (滞回 +50mV) */
 #define BAT_CUT_MV         3200U   /* 电压 < 3200mV: 过放保护, 关断输出 */
-#define BAT_CUT_RECOVER_MV 3350U   /* 回升到 3350mV: 恢复输出 (滞回) */
+#define BAT_CUT_RECOVER_MV 3350U   /* 回升到 3350mV: 恢复输出 (滞回 +150mV) */
 #define BAT_CHK_HOLD       40      /* 状态切换需连续 40 次采样 (50ms x 40 = 2s) */
 
 /* 电池状态机 */
 #define BAT_STATE_OK       0       /* 正常 */
 #define BAT_STATE_LOW      1       /* 低电量 (3.5V~3.2V): 提醒 */
 #define BAT_STATE_PROTECT  2       /* 过放保护 (<3.2V): 输出关断 */
+
+/* 无级调光参数 (按住亮度键连续平滑调节) */
+#define DIM_STEP            5U      /* 每步变化 5‰ (0.5%) */
+/* 长按加速手感 (三段): 起步慢速精细 -> 按住一会转中速 -> 再转快速 */
+#define DIM_SPD1_INT        60U     /* 初期:   每 60ms 一步 (精细) */
+#define DIM_SPD2_AT         1100U   /* 按下后 1.1s: 进入中速 */
+#define DIM_SPD2_INT        30U     /* 中速:   每 30ms 一步 */
+#define DIM_SPD3_AT         1900U   /* 按下后 1.9s: 进入快速 */
+#define DIM_SPD3_INT        12U     /* 快速:   每 12ms 一步 */
+#define DIM_MIN_PERMILLE    0U      /* 可调下限: 已开放到 0 (0=熄灭);
+                                     * 若低占空比频闪可改回 30 (3%) 实现下限钳位 */
+#define DIM_LONG_MS         300U    /* 长按判定: 超过则进入连续调节 */
+#define DIM_DBL_MS          350U    /* 双击间隔窗口 */
 
 /* 告警页显示策略 (省电: 告警屏耗电较大) */
 #define ALERT_AUTO_CLOSE_MS 60000U /* 告警页无操作 1 分钟自动关屏 */
@@ -87,6 +100,11 @@ volatile uint8_t    g_sleep_req   = 0;          /* 关机: 请求进入停机休
 volatile uint8_t    g_det1        = 0;          /* 组1 吸附状态缓存 (1=已连接) */
 volatile uint8_t    g_det2        = 0;          /* 组2 吸附状态缓存 (1=已连接; 内置款恒1) */
 
+/* 双击 BTN2 切换: 亮度调节对象  0=A串(组1) 1=B串(组2) 2=一起 */
+static volatile uint8_t s_dim_target = 2U;
+/* 双击 BTN3 切换: 点亮模式      0=只A亮 1=只B亮 2=一起亮 */
+static volatile uint8_t s_light_mode = 2U;
+
 volatile uint8_t    g_bat_state   = BAT_STATE_OK;  /* 电池状态机 (0=OK 1=LOW 2=PROTECT) */
 volatile uint8_t    g_ui_redraw   = 0;        /* 整屏重绘请求 (状态页切换) */
 static volatile uint16_t s_bat_cnt = 0;       /* 状态切换连续采样计数 */
@@ -100,13 +118,15 @@ volatile uint8_t    g_disp_change = 0;        /* 显示开关变更请求 (主�
 /* 唤醒后 300ms 内吞掉按键事件 (避免"开机后立刻再次关机") */
 static volatile uint32_t s_swallow_until = 0;
 
-/* 调试: 最近一次按键事件掩码 (页5 显示, 验证按键硬件) */
-static volatile uint8_t s_last_evt = 0;
-
 /* 亮度变更 -> 延时自动保存 (解决"直接按 Reset 不经过关机流程"的丢失问题) */
 static volatile uint8_t  s_save_dirty = 0;   /* 1=亮度有变更待保存 */
 static volatile uint32_t s_save_tick  = 0;   /* 最后一次变更的时刻 */
 #define SAVE_DELAY_MS   2000U                /* 变更后 2s 无操作即写入 Flash */
+
+/* 唤醒后延时屏幕恢复: 经过指定数量的 1ms 中断后再初始化/刷屏
+ * (关机期间 OLED 掉电, 需等供电稳定; 避免唤醒瞬间刷屏产生随机亮点) */
+static volatile uint32_t s_wake_resume_at = 0;   /* 0=无待处理; 非0=恢复时刻(g_ms_tick) */
+#define WAKE_RESUME_TICKS   500U                 /* 500 个 1ms 中断后恢复屏幕 */
 
 /* 周期任务调度计数 (ISR 内使用) */
 static volatile uint32_t s_cnt_5ms   = 0;     /* 按键扫描 5ms 计时器 */
@@ -143,6 +163,79 @@ static void ApplyOutputs(void)
     BSP_PWM_SetDuty(PWM_CH2, d2);       /* 组2 (PA03) */
 }
 
+/* ======================================================================
+ * BTN2/BTN3 多功能调光辅助 (单击微调 / 长按连续 / 双击切换)
+ * ==================================================================== */
+
+/**
+ * @brief 对单个灯组做一步亮度调节 (含 3% 下限与 0 熄灭跳变规则)
+ * @param g   目标灯组
+ * @param dir >0 加一步, <0 减一步
+ */
+static void Dim_AdjustGroup(volatile LEDGroup_t *g, int8_t dir)
+{
+    uint16_t br = g->brightness;
+
+    if (dir > 0)                                    /* 亮度+ */
+    {
+        if (br == 0U)
+            /* 从熄灭起步: 有下限时直接到下限额, 无下限时到最小一档 */
+            br = (DIM_MIN_PERMILLE != 0U) ? DIM_MIN_PERMILLE : DIM_STEP;
+        else
+            br = (br <= (1000U - DIM_STEP)) ? (br + DIM_STEP) : 1000U;
+    }
+    else                                            /* 亮度- */
+    {
+        if (br > DIM_MIN_PERMILLE)
+            br = (br - DIM_STEP >= DIM_MIN_PERMILLE)
+               ? (br - DIM_STEP) : DIM_MIN_PERMILLE;
+        else
+            br = 0U;                                /* 到下限再减 -> 熄灭(0) */
+    }
+    g->brightness = br;
+}
+
+/**
+ * @brief 按当前调节对象 (A/B/AB) 调整亮度并联动输出
+ */
+static void Dim_Adjust(uint8_t idx, int8_t dir)
+{
+    (void)idx;
+
+    if (s_dim_target != 1U)                         /* 目标含 A串(组1) */
+        Dim_AdjustGroup((volatile LEDGroup_t *)&g_grp1, dir);
+    if (s_dim_target != 0U)                         /* 目标含 B串(组2) */
+        Dim_AdjustGroup((volatile LEDGroup_t *)&g_grp2, dir);
+
+    ApplyOutputs();
+    g_ui_req = 1;
+    s_save_dirty = 1;
+    s_save_tick  = g_ms_tick;
+}
+
+/**
+ * @brief 双击 BTN2: 依次切换调节对象 A串 -> B串 -> 一起
+ */
+static void Dim_SwitchAdjustTarget(void)
+{
+    s_dim_target = (uint8_t)((s_dim_target + 1U) % 3U);
+    g_ui_req = 1;
+}
+
+/**
+ * @brief 双击 BTN3: 依次切换点亮模式 A亮 -> B亮 -> 一起亮
+ */
+static void Dim_SwitchLightMode(void)
+{
+    s_light_mode = (uint8_t)((s_light_mode + 1U) % 3U);
+
+    g_grp1.on = (s_light_mode != 1U) ? 1U : 0U;     /* 0=A亮, 2=AB -> 组1亮 */
+    g_grp2.on = (s_light_mode != 0U) ? 1U : 0U;     /* 1=B亮, 2=AB -> 组2亮 */
+
+    ApplyOutputs();
+    g_ui_req = 1;
+}
+
 /**
  * @brief 吸附检测更新: 读取检测状态, 变化时联动 PWM 输出
  * @note 由 App_Task1ms 的 5ms 节拍调用 (去抖在 bsp_detect.c)
@@ -171,10 +264,10 @@ static void UpdateDetect(void)
  * @brief 电池过放保护状态机 (由 50ms 采样刷新后调用)
  *
  * 状态迁移 (带 2s 连续确认 + 滞回, 防抖/防振荡):
- *   OK     -- 见 <3500mV 持续 2s --> LOW    (低电提醒, 输出不关)
- *   LOW    -- 回 >3550mV 持续 2s --> OK
+ *   OK     -- 见 <3350mV 持续 2s --> LOW    (低电提醒, 输出不关)
+ *   LOW    -- 回 >3400mV 持续 2s --> OK     (滞回 +50mV)
  *   LOW    -- 见 <3200mV 持续 2s --> PROTECT (关断输出 + OLED 告警)
- *   PROTECT-- 回 >3350mV 持续 2s --> OK (自动恢复输出)
+ *   PROTECT-- 回 >3350mV 持续 2s --> OK (自动恢复输出; 滞回 +150mV)
  */
 static void Battery_Check(void)
 {
@@ -268,9 +361,102 @@ void App_Task1ms(void)
 
         evt = BSP_BTNs_Scan();          /* 按键去抖扫描 (15ms 稳定) */
         if (evt)
+            HandleKey(evt);             /* 按键功能 (开关机等) */
+
+        /* ---------- BTN2/BTN3 多功能调光键 ----------
+         *  单击 (<300ms): 亮度一步调节 (DIM_STEP)
+         *  长按 (>=300ms): 连续平滑调节 (每 20ms 一步)
+         *  双击 (两击间隔 <=350ms):
+         *    BTN2(-): 依次切换调节对象  A串 -> B串 -> 一起
+         *    BTN3(+): 依次切换点亮模式  A亮 -> B亮 -> 一起亮 */
         {
-            s_last_evt = evt;           /* 调试: 记录事件供页5显示 */
-            HandleKey(evt);             /* 按键功能 (开关机/亮度) */
+            typedef struct
+            {
+                uint8_t  pressed;       /* 当前按住 */
+                uint8_t  long_fired;    /* 本次按压已进入长按连续调节 */
+                uint8_t  click_wait;    /* 短按后等待第二击 */
+                uint32_t press_tick;    /* 按下时刻 */
+                uint32_t click_tick;    /* 上次短按释放时刻 */
+            } DimKey_t;
+            static DimKey_t s_k[2];                     /* 0=BTN2, 1=BTN3 */
+            static uint32_t s_dim_tick = 0;
+            uint8_t held, idx;
+
+            if ((g_bat_state == BAT_STATE_OK) && (g_ms_tick >= s_swallow_until))
+            {
+                held = BSP_BTNs_GetState();
+
+                for (idx = 0U; idx < 2U; idx++)
+                {
+                    uint8_t   mask = (idx == 0U) ? BTN2_MASK : BTN3_MASK;
+                    DimKey_t *k    = &s_k[idx];
+
+                    if (held & mask)                    /* ---- 按住 ---- */
+                    {
+                        if (!k->pressed)
+                        {
+                            k->pressed    = 1U;
+                            k->long_fired = 0U;
+                            k->press_tick = g_ms_tick;
+                        }
+                        else if (!k->long_fired)
+                        {
+                            if ((uint32_t)(g_ms_tick - k->press_tick) >= DIM_LONG_MS)
+                            {
+                                k->long_fired = 1U;     /* 进入连续调节(慢速起步) */
+                                s_dim_tick = g_ms_tick - DIM_SPD1_INT;
+                            }
+                        }
+
+                        if (k->long_fired)
+                        {
+                            uint32_t hold = (uint32_t)(g_ms_tick - k->press_tick);
+                            uint32_t iv;
+
+                            /* 三段加速: 慢 -> 中 -> 快 */
+                            if (hold < DIM_SPD2_AT)       iv = DIM_SPD1_INT;
+                            else if (hold < DIM_SPD3_AT)  iv = DIM_SPD2_INT;
+                            else                          iv = DIM_SPD3_INT;
+
+                            if ((uint32_t)(g_ms_tick - s_dim_tick) >= iv)
+                            {
+                                s_dim_tick = g_ms_tick;
+                                Dim_Adjust(idx, (idx == 1U) ? 1 : -1);
+                            }
+                        }
+                    }
+                    else                                /* ---- 松开 ---- */
+                    {
+                        if (k->pressed)
+                        {
+                            k->pressed = 0U;
+                            if (!k->long_fired)
+                            {
+                                if (k->click_wait &&
+                                    ((uint32_t)(g_ms_tick - k->click_tick) <= DIM_DBL_MS))
+                                {
+                                    k->click_wait = 0U;         /* ===== 双击 ===== */
+                                    if (idx == 0U)
+                                        Dim_SwitchAdjustTarget();   /* 切换调节对象 */
+                                    else
+                                        Dim_SwitchLightMode();      /* 切换点亮模式 */
+                                }
+                                else
+                                {
+                                    k->click_wait = 1U;         /* 记为短按第一击 */
+                                    k->click_tick = g_ms_tick;
+                                }
+                            }
+                        }
+                        else if (k->click_wait &&
+                                 ((uint32_t)(g_ms_tick - k->click_tick) > DIM_DBL_MS))
+                        {
+                            k->click_wait = 0U;         /* 单击确认 -> 单步调节 */
+                            Dim_Adjust(idx, (idx == 1U) ? 1 : -1);
+                        }
+                    }
+                }
+            }
         }
 
 #if BSP_DETECT_ENABLED
@@ -300,7 +486,6 @@ void App_Task1ms(void)
  * ==================================================================== */
 static void HandleKey(uint8_t evt)
 {
-    uint16_t br;
 
     /* ---- 唤醒保护: 停机恢复后短时间内吞掉当前按键按下事件,
      *      避免"唤醒后立刻再次触关机/误操作" ---- */
@@ -356,24 +541,9 @@ static void HandleKey(uint8_t evt)
         }
     }
 
-    /* ---- BTN2/BTN3: 亮度-/+ (两组同步) ---- */
-    if (evt & (BTN2_MASK | BTN3_MASK))
-    {
-        br = g_grp1.brightness;                 /* 两组共用亮度, 取自组1 */
-
-        if (evt & BTN2_MASK)                    /* 亮度- */
-            br = (br >= 100) ? (br - 100) : 100;    /* 下限 10% */
-        if (evt & BTN3_MASK)                    /* 亮度+ */
-            br = (br <= 900) ? (br + 100) : 1000;   /* 上限 100% */
-
-        g_grp1.brightness = br;                 /* 同步两组 */
-        g_grp2.brightness = br;
-        g_ui_req = 1;
-        ApplyOutputs();
-
-        s_save_dirty = 1;                       /* 标记待保存 (2s 后写 Flash) */
-        s_save_tick  = g_ms_tick;
-    }
+    /* ---- BTN2/BTN3: 亮度调节 ----
+     * 无级调光: 按住连续调节 (在 App_Task1ms 的 5ms 节拍中处理),
+     * 此处不再做一次性步进, 避免与连续调节冲突 */
 }
 
 /* ======================================================================
@@ -419,20 +589,6 @@ static void OLED_ShowPct(uint8_t x, uint8_t y, uint16_t permille)
     b[3] = '%';
     b[4] = '\0';
     OLED_ShowStr(x, y, b);                          /* 固定 4 字符, 无残影 */
-}
-
-/**
- * @brief 调试: 显示 4 位十进制原始值 (0..4095)
- */
-static void OLED_ShowDec4(uint8_t x, uint8_t y, uint16_t v)
-{
-    uint8_t b[5];
-    b[0] = (uint8_t)('0' + v / 1000 % 10);
-    b[1] = (uint8_t)('0' + v / 100 % 10);
-    b[2] = (uint8_t)('0' + v / 10 % 10);
-    b[3] = (uint8_t)('0' + v % 10);
-    b[4] = '\0';
-    OLED_ShowStr(x, y, b);
 }
 
 /**
@@ -491,39 +647,38 @@ void UI_StaticInit(void)
             OLED_ShowStr(0, 2, (uint8_t *)"OUTPUT OFF");    /* 已关断输出 */
         else
             OLED_ShowStr(0, 2, (uint8_t *)"OUTPUT ON");     /* 仍输出 */
-        OLED_ShowStr(0, 3, (uint8_t *)"T");
-        OLED_ShowDec4(12, 3, g_bgr_trim_mv);            /* 调试: BGR trim 值 (mV) */
-        OLED_ShowStr(48, 3, (uint8_t *)"R");
-        OLED_ShowDec4(60, 3, g_bgr_raw);                /* 调试: BGR 通道原始值 */
-        UI_RefreshValues();             /* 画动态电压 */
+        OLED_ShowStr(0, 3, (uint8_t *)((g_bat_state == BAT_STATE_PROTECT)
+                                      ? "PROTECT<3.2V" : "CHARGE SOON"));
+        OLED_ShowStr(0, 4, (uint8_t *)"Charge then");       /* 提示 */
+        OLED_ShowStr(0, 5, (uint8_t *)"1:PWR KEY:SCR");     /* 任意键关屏/1:开关机 */
+        UI_RefreshValues();
         return;
     }
 
-    /* Row0: VBAT 标签 (数值 x30, 电池状态 x72) */
+    /* 正常页 (88x48: 6 行 x 14 字符) */
+
+    /* Row0: 电池电压 (值 x30, 状态 x66) */
     OLED_ShowStr(0, 0, (uint8_t *)"VBAT:");
 
-    /* Row1: 组占空比标签 (数值 x24 / x78) */
-    OLED_ShowStr(0, 1, (uint8_t *)"G1:");
-    OLED_ShowStr(54, 1, (uint8_t *)"G2:");
+    /* Row1: A/B 两组亮度 (值 x12 / x54) */
+    OLED_ShowStr(0, 1, (uint8_t *)"A:");
+    OLED_ShowStr(42, 1, (uint8_t *)"B:");
 
-    /* Row2: 电源 + 状态 (外挂款 D1/D2 检测, 内置款型号标识) */
+    /* Row2: 电源 + 当前调节对象 (值 x24 / x68) */
     OLED_ShowStr(0, 2, (uint8_t *)"PWR:");
+    OLED_ShowStr(44, 2, (uint8_t *)"TGT:");
+
+    /* Row3: 外挂款显示吸附检测; 内置款显示型号 */
 #if BSP_DETECT_ENABLED
-    OLED_ShowStr(42, 2, (uint8_t *)"D1:");
-    OLED_ShowStr(72, 2, (uint8_t *)"D2:");
+    OLED_ShowStr(0, 3, (uint8_t *)"D1:");
+    OLED_ShowStr(42, 3, (uint8_t *)"D2:");
 #else
-    OLED_ShowStr(42, 2, (uint8_t *)"BUILT-IN");
+    OLED_ShowStr(0, 3, (uint8_t *)"BUILT-IN");
 #endif
 
-    /* Row3: 按键提示 (3 键: 开关机 / 亮度±) */
-    OLED_ShowStr(0, 3, (uint8_t *)"1:PWR 2:BRT- 3:BRT+");
-
-#if (OLED_PAGES >= 8)
-    /* ---------- 0.96" 128x64: 下半屏(页5~7) ---------- */
-    /* 页5 为按键调试行 (动态刷新, 见 UI_RefreshValues) */
-    OLED_ShowStr(0, 6, (uint8_t *)"KEY2:PA4 BRT- KEY3:PA5 BRT+");
-    OLED_ShowStr(0, 7, (uint8_t *)"DET:Hi=LINK 3.5V/3.2V");
-#endif
+    /* Row4/5: 按键提示 (单击微调 / 长按连续 / 双击切换) */
+    OLED_ShowStr(0, 4, (uint8_t *)"2/3:BRT 1:PWR");
+    OLED_ShowStr(0, 5, (uint8_t *)"2x:TGT 3x:LIT");
 
     /* 画一遍动态数值, 避免首屏空白 */
     UI_RefreshValues();
@@ -539,10 +694,6 @@ void UI_RefreshValues(void)
     if (g_bat_state != BAT_STATE_OK)
     {
         OLED_ShowVBat(30, 1, g_vbat_mv);
-        OLED_ShowStr(72, 1, (uint8_t *)"raw");          /* 调试: 显示 ADC 原始值 */
-        OLED_ShowDec4(90, 1, g_adc_raw);
-        OLED_ShowStr(72, 2, (uint8_t *)"i12");          /* 调试: BGR1.2V raw */
-        OLED_ShowDec4(90, 2, g_bgr_raw);
         if (g_bat_state == BAT_STATE_LOW)   /* LOW 页: 标题 0.2s 交替闪烁 */
             OLED_ShowStr(0, 0, (uint8_t *)(((g_ms_tick / 200U) & 1U)
                                           ? "BATTERY LOW!" : "            "));
@@ -552,30 +703,23 @@ void UI_RefreshValues(void)
     /* Row0: 电压 + 电池状态灯 */
     OLED_ShowVBat(30, 0, g_vbat_mv);
     if (g_bat_state == BAT_STATE_LOW)
-        OLED_ShowStr(72, 0, (uint8_t *)(((g_ms_tick / 200U) & 1U) ? "LOW " : "    "));
+        OLED_ShowStr(66, 0, (uint8_t *)(((g_ms_tick / 200U) & 1U) ? "LOW" : "   "));
     else
-        OLED_ShowStr(72, 0, (uint8_t *)"OK  ");
+        OLED_ShowStr(66, 0, (uint8_t *)"OK ");
 
-    /* Row1: 组1/组2 占空比 */
-    OLED_ShowGroup(24, 1, (const LEDGroup_t *)&g_grp1);
-    OLED_ShowGroup(78, 1, (const LEDGroup_t *)&g_grp2);
+    /* Row1: A/B 两组亮度 */
+    OLED_ShowGroup(12, 1, (const LEDGroup_t *)&g_grp1);
+    OLED_ShowGroup(54, 1, (const LEDGroup_t *)&g_grp2);
 
-    /* Row2: 电源/吸附检测/当前组 */
+    /* Row2: 电源状态 + 当前调节对象 (A/B/AB) */
     OLED_ShowStr(24, 2, (uint8_t *)(g_power_on ? "ON " : "OFF"));
-#if BSP_DETECT_ENABLED
-    OLED_ShowDet(60, 2, g_det1);
-    OLED_ShowDet(90, 2, g_det2);
-#endif
+    OLED_ShowStr(68, 2, (uint8_t *)((s_dim_target == 0U) ? "A  " :
+                                    (s_dim_target == 1U) ? "B  " : "AB "));
 
-#if (OLED_PAGES >= 8)
-    /* 页5: 按键调试 — 实时电平状态 ST 与最近事件 EV (各 3 位二进制位域)
-     * 按住 KEY1 -> ST 显示 1; 按住 KEY2 -> 2; 按住 KEY3 -> 4 */
-    OLED_ShowStr(0, 5, (uint8_t *)"ST:");
-    OLED_ShowDec4(18, 5, BSP_BTNs_GetState());
-    OLED_ShowStr(42, 5, (uint8_t *)"EV:");
-    OLED_ShowDec4(60, 5, s_last_evt);
-    OLED_ShowStr(84, 5, (uint8_t *)"S:");
-    OLED_ShowDec4(96, 5, (uint16_t)(BSP_SAVE_GetRtcSec() % 10000U));  /* RTC秒(尾4位) */
+    /* Row3: 外挂款吸附检测状态 */
+#if BSP_DETECT_ENABLED
+    OLED_ShowDet(18, 3, g_det1);
+    OLED_ShowDet(60, 3, g_det2);
 #endif
 }
 
@@ -604,6 +748,21 @@ static void Board_Init(void)
     __SYSCTRL_GPIOA_CLK_ENABLE();
     __SYSCTRL_GPIOB_CLK_ENABLE();
 
+    /* ---- PWM 输出引脚提前拉低 (最先配置) ----
+     * 复位/初始化期间 GPIO 高阻悬空, SY7200 EN 被拉高会点亮 LED;
+     * 先置低电平再配置为输出, 把"悬空点亮"缩短到启动代码的几百 us */
+    PA03_SETLOW();
+    PB01_SETLOW();
+    {
+        GPIO_InitTypeDef gpio = {0};
+        gpio.IT   = GPIO_IT_NONE;
+        gpio.Mode = GPIO_MODE_OUTPUT_PP;
+        gpio.Pins = GPIO_PIN_3;
+        GPIO_Init(CW_GPIOA, &gpio);     /* PA03 (PWM2) */
+        gpio.Pins = GPIO_PIN_1;
+        GPIO_Init(CW_GPIOB, &gpio);     /* PB01 (PWM1) */
+    }
+
     /* ---- CE: LDO 使能 (PB04, 上电默认使能) ---- */
     gpio.IT   = GPIO_IT_NONE;
     gpio.Mode = GPIO_MODE_OUTPUT_PP;
@@ -615,8 +774,8 @@ static void Board_Init(void)
     /* ---- 亮度记录: RTC(LSI) 初始化 + Flash 读取 ----
      * 距上次关机 <= 1 小时: 恢复保存亮度; 否则默认 10% */
     BSP_SAVE_Init();
-    g_grp1.brightness = BSP_SAVE_GetBootBrightness();
-    g_grp2.brightness = g_grp1.brightness;
+    g_grp1.brightness = BSP_SAVE_GetBootBrightness();   /* 内部已做 3% 下限钳位 */
+    g_grp2.brightness = BSP_SAVE_GetBootBrightness2();
 
     /* ---- 外设 ---- */
     I2C_GPIO_Init();                    /* 软件 I2C (OLED) */
@@ -667,8 +826,11 @@ int main(void)
         {
             g_sleep_req = 0;
 
-            /* 关机前保存当前亮度到 Flash (含 RTC 时间戳, 供 1 小时窗口恢复) */
-            BSP_SAVE_StoreOnShutdown(g_grp1.brightness);
+            /* 关机处理期间吞掉所有按键事件 (含松手回弹), 防止误翻回开机 */
+            s_swallow_until = g_ms_tick + 100000U;
+
+            /* 关机前保存两组亮度到 Flash (含 RTC 时间戳, 供 1 小时窗口恢复) */
+            BSP_SAVE_StoreOnShutdown(g_grp1.brightness, g_grp2.brightness);
             s_save_dirty = 0;
 
             BSP_POWER_EnterStop();          /* 休眠, 唤醒后返回 */
@@ -692,9 +854,27 @@ int main(void)
                                              * 正按着的键被预置为"已按下", 不产生事件 */
             s_swallow_until = g_ms_tick + 300;  /* 之后再保留 300ms 保护窗 */
 
-            OLED_ON();                      /* 开屏 */
-            UpdateDetect();                 /* 刷新吸附状态并联动输出 */
-            g_ui_req = 1;                   /* 刷一次界面 */
+            /* 唤醒后亮度恢复默认 10% (不再保持关机前值) */
+            g_grp1.brightness = 100;
+            g_grp2.brightness = 100;
+            ApplyOutputs();
+            UpdateDetect();                 /* 恢复吸附状态联动 */
+
+            /* 屏幕延后恢复: 先禁刷屏, 等指定数量的 1ms 中断后再重新初始化
+             * (屏在关机期间掉电; 立即刷屏会出现随机亮点/花屏) */
+            g_disp_on = 0;                  /* 屏未就绪, 禁止刷屏 */
+            s_wake_resume_at = g_ms_tick + WAKE_RESUME_TICKS;
+        }
+
+        /* ---------- 唤醒后延时屏幕恢复 (等 500 个 1ms 中断) ----------
+         * 此时屏供电已稳定: 完整重新初始化 (含上电等待+清屏), 再整屏重绘 */
+        if (s_wake_resume_at && (g_ms_tick >= s_wake_resume_at))
+        {
+            s_wake_resume_at = 0;
+            OLED_Init();                    /* 屏曾掉电: 完整重新初始化 */
+            g_disp_on   = 1;                /* 恢复刷屏 */
+            g_ui_req    = 0;
+            g_ui_redraw = 1;                /* 整屏重绘 (正常页/告警页) */
         }
 
         /* ---------- 亮度变更延时自动保存 (2s) ----------
@@ -703,7 +883,7 @@ int main(void)
             ((uint32_t)(g_ms_tick - s_save_tick) >= SAVE_DELAY_MS))
         {
             s_save_dirty = 0;
-            BSP_SAVE_StoreOnShutdown(g_grp1.brightness);
+            BSP_SAVE_StoreOnShutdown(g_grp1.brightness, g_grp2.brightness);
         }
 
         /* ---------- 显示开关 (告警页按键关闭/重新点亮) ---------- */
