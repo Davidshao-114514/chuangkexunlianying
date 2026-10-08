@@ -5,29 +5,28 @@
 #include "cw32l010_adc.h"
 #include "cw32l010_gpio.h"
 
-/* VBAT 电池电压采样: PB00 = ADC_IN7
- * 分压电路: 上/下电阻均为 10K (VBAT ---10K---[ADC引脚]---10K---GND)
- *   -> ADC 采样电压 = VBAT/2, 分压比 = 2 倍还原
- *   -> 引脚源阻抗 = 10K || 10K = 5KΩ
+/*******************************************************************************
+ * BSP_ADC - 电池电压采样 (内部 BGR 1.2V 反推, 无需外部分压)
  *
- * [重要] 本机 VBAT 直接给 MCU 供电 (VDD = VBAT), 而 ADC 参考 = VDD,
- *        若按固定 3.3V 换算, raw 恒为满量程一半(2048), 与 VBAT 无关!
- *        故必须用内部 BGR 1.2V 反推真实 VDD 再折算:
- *          VDD(mV)  = 4095 x BGR_mV / raw_bgr
- *          VBAT(mV) = VDD x raw_vbat / 4095 x 2 = 2 x BGR_mV x raw_vbat / raw_bgr
- *        BGR_mV 为芯片出厂 trim 精确值 (mV)。
- * 12bit, 单次转换 + 均值滤波 */
+ * [方案] MCU 由电池直接供电 => VDD = VBAT; ADC 参考 = VDD。
+ *   采样内部 BGR1.2V 通道, 按比例反推供电电压:
+ *       VBAT(mV) = VDD(mV) = BGR_mV x 4095 / raw_bgr
+ *   BGR_mV 为芯片出厂 trim 精确值 (mV), 存于 0x001007D2。
+ *
+ * [省电] 外部 10K/10K 分压已拆除 (原静态耗电约 210uA @4.2V);
+ *   BGR 也仅在测量瞬间开启 (测量完毕立即关闭), 待机零额外功耗。
+ *   PB00 悬空, 保持模拟输入 (无电流)。
+ *
+ * [注意] 依赖 "电池直供 MCU" 的硬件前提; 若将来在电池与 VDD 之间增加
+ *   稳压/二极管等, 测得的是 MCU 端电压而非电池端电压。
+ ******************************************************************************/
 
-#define VBAT_DIV_RATIO       2U          /* 分压比: 10K上/10K下 -> VBAT/2, 还原乘2 */
-#define VBAT_AVG_NUM         8           /* 均值采样次数 (50ms 周期内采样) */
-#define BGR_AVG_NUM          4           /* BGR 通道均值次数 */
+void     BSP_ADC_Init(void);
+uint16_t BSP_ADC_ReadVbatMv(void);          /* 电池电压 mV */
 
-void BSP_ADC_Init(void);
-uint16_t BSP_ADC_ReadVbatMv(void);
-
-/* 调试用: 最近一次均值后的 ADC 原始值 (0..4095) */
-extern volatile uint16_t g_adc_raw;      /* VBAT 通道 (CH7) */
-extern volatile uint16_t g_bgr_raw;      /* BGR1.2V 通道 (CH15) */
-extern volatile uint16_t g_bgr_trim_mv;  /* BGR 出厂 trim 值 (mV) */
+/* 调试用原始值 */
+extern volatile uint16_t g_adc_raw;         /* 最近一次 BGR 通道原始均值 */
+extern volatile uint16_t g_bgr_raw;         /* 同上 (保留别名) */
+extern volatile uint16_t g_bgr_trim_mv;     /* BGR 出厂 trim 值 (mV) */
 
 #endif /* __BSP_ADC_H */

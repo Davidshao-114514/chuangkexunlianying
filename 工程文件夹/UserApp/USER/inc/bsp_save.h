@@ -16,10 +16,12 @@
 
 #define BSP_SAVE_WINDOW_SEC     3600U   /* 恢复窗口: 1 小时 (秒) */
 #define BSP_SAVE_DEFAULT_BRIGHT 100U    /* 默认亮度: 千分数 100 = 10% */
+#define BSP_SAVE_MIN_BRIGHT     0U      /* 可调下限 (已开放到 0; 如遇频闪可改回 30) */
 
 void     BSP_SAVE_Init(void);                       /* 上电: 启动 LSI/RTC, 读记录 */
-uint16_t BSP_SAVE_GetBootBrightness(void);          /* 开机亮度: 窗口内恢复, 否则默认 */
-void     BSP_SAVE_StoreOnShutdown(uint16_t brightness);  /* 保存亮度 (Flash) */
+uint16_t BSP_SAVE_GetBootBrightness(void);          /* 开机亮度(组1): 窗口内恢复 */
+uint16_t BSP_SAVE_GetBootBrightness2(void);         /* 开机亮度(组2): 窗口内恢复 */
+void     BSP_SAVE_StoreOnShutdown(uint16_t bright1, uint16_t bright2);  /* 保存两组亮度 */
 uint32_t BSP_SAVE_GetRtcSec(void);                  /* 调试: 当前 RTC 当天秒数 */
 
 #endif /* __BSP_SAVE_H */

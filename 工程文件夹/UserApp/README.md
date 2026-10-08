@@ -6,8 +6,8 @@ Keil MDK5 (uVision) + **AC6 (ARMCLANG)** 编译，所有外设时钟来自 **无
 ## 功能特性
 
 - **HSI 48MHz 单时钟**：`SYSCTRL_HSIOSC_DIV1`，HSE/LSE 不使用，OSC 引脚复用为检测口
-- **双组 PWM 调光**：ATIM_CH2(PB01) / ATIM_CH3(PA03)，20kHz，2400 级，适配 SY7200 EN/PWM (20kHz~1MHz)
-- **0.91" OLED**：SSD1306 **128x32** (4 页)，软件 I2C (PB05/PB06)，驱动自 H563 工程移植
+- **双组 PWM 调光**：ATIM_CH2(PB01) / ATIM_CH3(PA03)，8kHz，6000 级，适配 RY3730 EN/PWM (100Hz~10kHz)
+- **0.5" OLED**：CH1115 **88x48** (6 页)，软件 I2C (PB05/PB06)，驱动自 H563 工程移植
 - **磁吸 4pin 外接 LED 吸附检测**（外挂款）：复用 OSC- (PA01)/OSC+ (PA00)，高电平=已吸附；未吸附禁止输出
 - **电池电压监测**：PB00 = ADC_IN7，**10K/10K 分压 (VBAT/2)**，50ms 采样 + 8 次均值
 - **软件过放保护**：<3.5V 低电提醒（告警页/闪烁）；<3.2V 关断输出；2s 确认 + 滞回 (3.55/3.35V) 防振荡；告警页可按键关屏，1 分钟无操作自动关屏省电
@@ -34,7 +34,7 @@ Keil MDK5 (uVision) + **AC6 (ARMCLANG)** 编译，所有外设时钟来自 **无
       │    PB01 ATIM_CH2 ── PWM 低边开关 ──▶ LED1-〔SY7200 EN/PWM〕 ┼─▶ 组1 LED
       │    PA03 ATIM_CH3 ── PWM 低边开关 ──▶ LED2-〔SY7200 EN/PWM〕 ┼─▶ 组2 LED
       │    PB04 CE ──▶ LDO 使能 (LDO→3.3V 输出/或直接给灯组供电)     │
-      │    PB05 SDA ────▶ OLED SSD1306 (0.91", 128x32, I2C 0x3C)    │
+      │    PB05 SDA ────▶ OLED CH1115 (0.5", 88x48, I2C 0x3C)    │
       │    PB06 SCL ────▶                                        ▲  │
       │    PB07/NRST ────▶ OLED RST (并联系统复位)                 │  │
       │    PA02 PA04 PA05 PA06 PB03 ── 按键(外部上拉, 按下为低)     │  │
@@ -87,8 +87,8 @@ Keil MDK5 (uVision) + **AC6 (ARMCLANG)** 编译，所有外设时钟来自 **无
 
 | 器件 | 接口 | 说明 |
 |---|---|---|
-| OLED (SSD1306 0.91") | SCL=PB06, SDA=PB05, RST=PB07/NRST | 软件 I2C @~100kHz, 地址 0x3C; 128x32 4 页 |
-| LED (经 SY7200) | EN/PWM = PB01/PA03 | 20kHz, 2400 级; PWM 高=亮 |
+| OLED (CH1115 0.5") | SCL=PB06, SDA=PB05, RST=PB07/NRST | 软件 I2C @~100kHz, 地址 0x3C; 88x48 4 页 |
+| LED (经 SY7200) | EN/PWM = PB01/PA03 | 8kHz, 6000 级; PWM 高=亮 |
 | 磁吸 DET | PA00/PA01, 外部下拉 + 灯端 3.3V | 高=已吸附; 未吸附组不输出 |
 | LDO | CE = PB04 | 关机断电 (GPIO 即可/有效电平 CE_ACTIVE_LEVEL 可配) |
 | 电池采样 | PB00 + 10K/10K | VBAT/2, 测限 6.6V |

@@ -57,9 +57,13 @@ void BSP_POWER_EnterStop(void)
     NVIC_ClearPendingIRQ(GPIOB_IRQn);
     NVIC_EnableIRQ(GPIOB_IRQn);
 
-    /* ---- 5. 等待 PB03 释放 (松开后为低), 或 2s 超时 ----
-     * 防止关机时手指仍按着/电平残余产生边沿, 导致立即假唤醒 */
-    for (i = 0; i < 2000U; i++)
+    /* ---- 5. 进 STOP 前的关键时序 (防"松手即重启") ----
+     * 机械按键松手时触点回弹(低-高-低抖动)会产生瞬态上升沿;
+     * 若在 WFI 后出现会被当作"按下"立即唤醒。
+     * 处理: (a) 必须等到 PB03 释放(低);
+     *       (b) 再延时约 100ms 越过回弹窗口;
+     *       (c) 最后清标志再睡 -> WFI 后只有新的稳定按下才唤醒 */
+    while (1)
     {
         if ((CW_GPIOB->IDR & GPIO_PIN_3) == 0U)
             break;                              /* 已释放(低) */
@@ -68,7 +72,12 @@ void BSP_POWER_EnterStop(void)
             for (k = 0; k < 48000U; k++);       /* 约 1ms */
         }
     }
-    GPIOB_INTFLAG_CLR(CW_GPIOB->ISR);           /* 清等待期间的边沿 */
+    {
+        volatile uint32_t k;
+        for (k = 0; k < 480000U; k++);          /* 约 100ms: 越过松手回弹 */
+    }
+    GPIOB_INTFLAG_CLR(CW_GPIOB->ISR);           /* 清等待/回弹期间的所有边沿 */
+    (void)i;                                     /* i 已不再用于等待 */
 
     /* ---- 6. 进入停机模式 (STOP: CPU/内核停止, GPIO 下降沿可唤醒) ---- */
     pwr.PWR_Sevonpend   = PWR_Sevonpend_Disable;
