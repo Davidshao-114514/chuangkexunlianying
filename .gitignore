@@ -8,5 +8,11 @@ __pycache__/
 .env.*
 ~$*
 *.uvguix.*
-MDK/output/
-工程文件夹/UserApp/MDK/output/
+MDK/output/*
+!MDK/output/exe/
+MDK/output/exe/*
+!MDK/output/exe/*.hex
+工程文件夹/UserApp/MDK/output/*
+!工程文件夹/UserApp/MDK/output/exe/
+工程文件夹/UserApp/MDK/output/exe/*
+!工程文件夹/UserApp/MDK/output/exe/*.hex
